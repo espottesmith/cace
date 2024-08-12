@@ -163,8 +163,12 @@ class AtomicData(torch_geometric.data.Data):
             else:
                 forces = None
         molecular_index = atoms.arrays.get(data_key["molecular_index"], None) # index of molecules
+
         stress = atoms.info.get(data_key["stress"], None)  # eV / Ang
         virials = atoms.info.get(data_key["virials"], None)
+
+        charges = atoms.arrays.get(data_key["charges"], None)
+        spins = atoms.arrays.get(data_key["spins"], None)
 
         # process these to make tensors
         cell = (
@@ -192,6 +196,7 @@ class AtomicData(torch_geometric.data.Data):
             if energy is not None
             else None
         )
+
         stress = (
             voigt_to_matrix(
                 torch.tensor(stress, dtype=torch.get_default_dtype())
@@ -205,11 +210,22 @@ class AtomicData(torch_geometric.data.Data):
             else None
         )
 
+        charges = (
+            torch.tensor(charges, dtype=torch.get_default_dtype())
+            if charges is not None
+            else None
+        )
+        spins = (
+            torch.tensor(spins, dtype=torch.get_default_dtype())
+            if spins is not None
+            else None
+        )
+
         #  obtain additional info
         # enumerate the data_key and extract data
         additional_info = {}
         for key, kk in data_key.items():
-            if kk is None or key in ['energy', 'forces', 'stress', 'virial', 'molecular_index']:
+            if kk is None or key in ['energy', 'forces', 'stress', 'virial', 'charges', 'spins', 'molecular_index']:
                 continue
             else:
                 more_info = atoms.info.get(data_key[kk], None)
@@ -235,6 +251,8 @@ class AtomicData(torch_geometric.data.Data):
             energy=energy,
             stress=stress,
             virials=virials,
+            charges=charges,
+            spins=spins,
             additional_info=additional_info,
         )
 
