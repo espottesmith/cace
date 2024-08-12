@@ -19,10 +19,17 @@ class CACECalculator(Calculator):
         model_path: str or nn.module, path to model
         device: str, device to run on (cuda or cpu)
         compute_stress: bool, whether to compute stress
+        compute_charges: bool, whether to compute atomic partial charges
+        compute_spins: bool, whether to compute atomic partial spins / magnetic moments
         energy_key: str, key for energy in model output
         forces_key: str, key for forces in model output
+        stress_key: str, key for stresses in model output
+        charges_key: str, key for atomic partial charges in model output
+        spins_key: str, key for atomic partial spins in model output
         energy_units_to_eV: float, conversion factor from model energy units to eV
         length_units_to_A: float, conversion factor from model length units to Angstroms
+        charge_units_to_au: float, conversion factor from model charge units to atomic units
+        spin_units_to_au: float, conversion factor from model spin units to atomic units
         atomic_energies: dict, dictionary of atomic energies to add to model output
     """
 
@@ -32,10 +39,16 @@ class CACECalculator(Calculator):
         device: str,
         energy_units_to_eV: float = 1.0,
         length_units_to_A: float = 1.0,
+        charge_units_to_au: float = 1.0,
+        spin_units_to_au: float = 1.0,
         compute_stress = False,
+        compute_charges = False,
+        compute_spins = False,
         energy_key: str = 'energy',
         forces_key: str = 'forces',
         stress_key: str = 'stress',
+        charges_key: str = 'charges',
+        spins_key: str = 'magmoms',
         atomic_energies: dict = None,
         output_index: int = None, # only used for multi-output models
         **kwargs,
@@ -46,6 +59,8 @@ class CACECalculator(Calculator):
             "energy",
             "forces",
             "stress",
+            "charges",
+            "magmoms",
         ]
 
         self.results = {}
@@ -70,9 +85,14 @@ class CACECalculator(Calculator):
         self.atomic_energies = atomic_energies
 
         self.compute_stress = compute_stress
+        self.compute_charges = compute_charges
+        self.compute_spins = compute_spins
+
         self.energy_key = energy_key 
         self.forces_key = forces_key
         self.stress_key = stress_key
+        self.charges_key = charges_key
+        self.spins_key = spins_key
 
         self.output_index = output_index
         
@@ -107,7 +127,14 @@ class CACECalculator(Calculator):
 
         batch_base = next(iter(data_loader)).to(self.device)
         batch = batch_base.clone()
-        output = self.model(batch.to_dict(), training=False, compute_stress=self.compute_stress, output_index=self.output_index)
+        output = self.model(
+            batch.to_dict(),
+            training=False,
+            compute_stress=self.compute_stress,
+            compute_charges=self.compute_charges,
+            compute_spins=self.compute_spins,
+            output_index=self.output_index
+        )
         energy_output = to_numpy(output[self.energy_key])
         forces_output = to_numpy(output[self.forces_key])
         # subtract atomic energies if available
@@ -115,8 +142,10 @@ class CACECalculator(Calculator):
             e0 = sum(self.atomic_energies.get(Z, 0) for Z in atoms.get_atomic_numbers())
         else:
             e0 = 0.0
+        
         self.results["energy"] = (energy_output + e0) * self.energy_units_to_eV
         self.results["forces"] = forces_output * self.energy_units_to_eV / self.length_units_to_A
+
         if self.compute_stress and output[self.stress_key] is not None:
             stress = to_numpy(output[self.stress_key])
             # stress has units eng / len^3:
@@ -124,5 +153,13 @@ class CACECalculator(Calculator):
                 stress * (self.energy_units_to_eV / self.length_units_to_A**3)
             )[0]
             self.results["stress"] = full_3x3_to_voigt_6_stress(self.results["stress"])
+        
+        if self.compute_charges and output[self.charges_key] is not None:
+            charges_output = to_numpy(output[self.charges_key])
+            self.results["charges"] = charges_output * self.charge_units_to_au
+        
+        if self.compute_spins and output[self.spins_key] is not None:
+            spins_output = to_numpy(output[self.spins_key])
+            self.results["magmoms"] = spins_output * self.spin_units_to_au
 
         return self.results

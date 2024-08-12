@@ -21,13 +21,16 @@ default_data_key = {
     "molecular_index": "molecular_index",
     "stress": "stress",
     "virials": "virials",
+    "charges": "charges",
+    "spins": "magmoms",  # confirm
     "dipole":  None,
-    "charges": None,
     "weights": None,
     "energy_weight": None,
     "force_weight": None,
     "stress_weight": None,
     "virial_weight": None,
+    "charges_weight": None,
+    "spins_weight": None,
 }
 
 class AtomicData(torch_geometric.data.Data):
@@ -49,11 +52,14 @@ class AtomicData(torch_geometric.data.Data):
     virials: torch.Tensor
     dipole: torch.Tensor
     charges: torch.Tensor
+    spins: torch.Tensor
     weight: torch.Tensor
     energy_weight: torch.Tensor
     forces_weight: torch.Tensor
     stress_weight: torch.Tensor
     virials_weight: torch.Tensor
+    charges_weight: torch.Tensor
+    spins_weight: torch.Tensor
 
     def __init__(
         self,
@@ -69,9 +75,10 @@ class AtomicData(torch_geometric.data.Data):
         energy: Optional[torch.Tensor] = None,  # [, ]
         stress: Optional[torch.Tensor] = None,  # [1,3,3]
         virials: Optional[torch.Tensor] = None,  # [1,3,3]
+        charges: Optional[torch.Tensor] = None,  # [n_nodes, ]
+        spins: Optional[torch.Tensor] = None,  # [n_nodes, ]
         additional_info: Optional[Dict] = None, 
         #dipole: Optional[torch.Tensor],  # [, 3]
-        #charges: Optional[torch.Tensor],  # [n_nodes, ]
     ):
         # Check shapes
         if num_nodes is None:
@@ -88,8 +95,9 @@ class AtomicData(torch_geometric.data.Data):
         assert energy is None or len(energy.shape) == 0
         assert stress is None or stress.shape == (1, 3, 3)
         assert virials is None or virials.shape == (1, 3, 3)
+        assert charges is None or charges.shape == (num_nodes,)
+        assert spins is None or spins.shape == (num_nodes,)
         #assert dipole is None or dipole.shape[-1] == 3
-        #assert charges is None or charges.shape == (num_nodes,)
         # Aggregate data
         data = {
             "edge_index": edge_index,
@@ -104,8 +112,9 @@ class AtomicData(torch_geometric.data.Data):
             "energy": energy,
             "stress": stress,
             "virials": virials,
+            "charges": charges,
+            "spins": spins,
             #"dipole": dipole,
-            #"charges": charges,
         }
         if additional_info is not None:
             data.update(additional_info)
