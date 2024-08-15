@@ -138,8 +138,13 @@ class NeuralNetworkPotential(AtomisticModel):
 
         if 'stress' in self.model_outputs or 'CACE_stress' in self.model_outputs:
             compute_stress = True
+        if 'charges' in self.model_outputs or 'CACE_charges' in self.model_outputs:
+            compute_charges = True
+        if 'spins' in self.model_outputs or 'CACE_spins' in self.model_outputs:
+            compute_spins = True
+
         for m in self.input_modules:
-            data = m(data, compute_stress=compute_stress, compute_virials=compute_virials)
+            data = m(data, compute_stress=compute_stress, compute_virials=compute_virials, compute_charges=compute_charges, compute_spins=compute_spins)
 
         data = self.representation(data)
 

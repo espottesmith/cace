@@ -9,7 +9,7 @@ import torch.nn as nn
 from math import factorial
 from collections import OrderedDict
 
-__all__=['AngularComponent', 'AngularComponent_GPU', 'make_lxlylz_list', 'make_lxlylz', 'make_l_dict', 'l_dict_to_lxlylz_list', 'compute_length_lxlylz', 'compute_length_lmax', 'compute_length_lmax_numerical', 'lxlylz_factorial_coef', 'lxlylz_factorial_coef_torch', 'l1l2_factorial_coef']
+__all__ = ['AngularComponent', 'AngularComponent_GPU', 'make_lxlylz_list', 'make_lxlylz', 'make_l_dict', 'l_dict_to_lxlylz_list', 'compute_length_lxlylz', 'compute_length_lmax', 'compute_length_lmax_numerical', 'lxlylz_factorial_coef', 'lxlylz_factorial_coef_torch', 'l1l2_factorial_coef']
 
 import torch
 import torch.nn as nn

@@ -18,7 +18,8 @@ def get_neighborhood(
     cutoff: float,
     pbc: Optional[Tuple[bool, bool, bool]] = None,
     cell: Optional[np.ndarray] = None,  # [3, 3]
-    true_self_interaction=False,
+    true_self_interaction: bool = False,
+    max_layers: int = 5,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if pbc is None:
         pbc = (False, False, False)
@@ -35,13 +36,12 @@ def get_neighborhood(
     identity = np.identity(3, dtype=float)
     max_positions = np.max(np.absolute(positions)) + 1
     # Extend cell in non-periodic directions
-    # For models with more than 5 layers, the multiplicative constant needs to be increased.
     if not pbc_x:
-        cell[:, 0] = max_positions * 5 * cutoff * identity[:, 0]
+        cell[:, 0] = max_positions * max_layers * cutoff * identity[:, 0]
     if not pbc_y:
-        cell[:, 1] = max_positions * 5 * cutoff * identity[:, 1]
+        cell[:, 1] = max_positions * max_layers * cutoff * identity[:, 1]
     if not pbc_z:
-        cell[:, 2] = max_positions * 5 * cutoff * identity[:, 2]
+        cell[:, 2] = max_positions * max_layers * cutoff * identity[:, 2]
 
     sender, receiver, unit_shifts = neighbour_list(
         quantities="ijS",

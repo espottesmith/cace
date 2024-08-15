@@ -23,11 +23,17 @@ from ..modules import (
 
 __all__ = ["Cace"]
 
+# TODO: how to add global features to the graph?
+# How to incorporate global features in message-passing?
+# Look at BonDNet?
+
 class Cace(nn.Module):
 
     def __init__(
         self,
         zs: Sequence[int],
+        overall_charge: Optional[int] = None,
+        overall_spin_multiplicity: Optional[int] = None, 
         n_atom_basis: int,
         cutoff: float,
         radial_basis: nn.Module,
@@ -50,6 +56,8 @@ class Cace(nn.Module):
         """
         Args:
             zs: list of atomic numbers
+            overall_charge: charge of this system
+            overall_spin_multiplicity: overall spin multiplicity of this system
             n_atom_basis: number of features to describe atomic environments.
                 This determines the size of each embedding vector; i.e. embeddings_dim.
             edge_coding: layer for encoding edge type
