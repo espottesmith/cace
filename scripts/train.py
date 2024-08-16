@@ -83,6 +83,7 @@ def main():
         predict_name='CACE_forces', 
         loss_fn=torch.nn.MSELoss(), 
         loss_weight=args.force_loss_weight)
+    
 
 
     e_metric = Metrics(
@@ -119,4 +120,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -72,6 +72,7 @@ def get_dataset_from_xyz(
     test_path: str = None,
     seed: int = 1234,
     data_key: Dict[str, str] = None,
+    # TODO: might need/want to split up by charge
     atomic_energies: Dict[int, float] = None
 ) -> SubsetAtoms:
     """Load training and test dataset from xyz file"""

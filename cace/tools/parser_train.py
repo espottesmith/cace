@@ -13,7 +13,16 @@ def parse_arguments():
     parser.add_argument('--valid_fraction', type=float, default=0.1, help='Fraction of data to use for validation')
     parser.add_argument('--energy_key', type=str, default='energy', help='Key for energy in the dataset')
     parser.add_argument('--forces_key', type=str, default='forces', help='Key for forces in the dataset')
-    parser.add_argument('--cutoff', type=float, default=4.0, help='Cutoff radius for interactions')
+    parser.add_argument('--total_charge_key', type=str, help='Key for total (molecular) charge in the dataset')
+    parser.add_argument('--spin_multiplicity_key', type=str, help='Key for overall spin multiplicity in the dataset')
+    parser.add_argument('--partial_charges_key', type=str, help='Key for atomic partial charges in the dataset')
+    parser.add_argument(
+        '--partial_spins_key',
+        type=str,
+        help='Key for atomic partial spins or magnetic moments in the dataset'
+    )
+
+    parser.add_argument('--cutoff', type=float, default=4.0, help='Cutoff radius for interactions (in Angstrom)')
     parser.add_argument('--batch_size', type=int, default=10, help='Batch size for training')
     parser.add_argument('--valid_batch_size', type=int, default=20, help='Batch size for validation')
     parser.add_argument('--use_device', type=str, default='cpu', help='Device to use for training')
@@ -54,6 +63,12 @@ def parse_arguments():
     parser.add_argument('--second_phase_epochs', type=int, default=100, help='Number of epochs for the second phase of training')
     parser.add_argument('--energy_loss_weight', type=float, default=1.0, help='Weight for the energy loss in phase 1')
     parser.add_argument('--force_loss_weight', type=float, default=1000.0, help='Weight for the force loss in both phases')
+    # TODO: what are reasonable defaults here?
+    # And do we want to have these losses in both phases of the training?
+    parser.add_argument('--total_charge_loss_weight', type=float, default=1.0, help='Weight for the total charge loss in both phases')
+    parser.add_argument('--spin_multiplicity_loss_weight', type=float, default=1.0, help='Weight for the total spin multiplicity loss in both phases')    
+    parser.add_argument('--partial_charge_loss_weight', type=float, default=1.0, help='Weight for the partial charge loss in both phases')
+    parser.add_argument('--partial_spin_loss_weight', type=float, default=1.0, help='Weight for the partial spin loss in both phases')
     parser.add_argument('--num_restart', type=int, default=5, help='Number of restarts for the training during phase 1')
     parser.add_argument('--second_phase_energy_loss_weight', type=float, default=1000.0, 
                         help='Weight for the energy loss in phase 2')
