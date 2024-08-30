@@ -30,21 +30,18 @@ import torch
 from torch import Tensor
 from typing_extensions import Self
 
+from cace.tools.torch_geometric.data import size_repr  # see torch_geometric.data.data.size_repr
+
 # TODO: what do we need from here, and what can we get rid of
 # Try to include only the minimal subset of code from pytorch_geometric
 from torch_geometric import Index
 from torch_geometric.data import EdgeAttr, FeatureStore, GraphStore, TensorAttr
-from torch_geometric.data.data import BaseData, Data, size_repr, warn_or_raise
+from torch_geometric.data.data import warn_or_raise
 from torch_geometric.data.graph_store import EdgeLayout
 from torch_geometric.data.storage import BaseStorage, EdgeStorage, NodeStorage
 from torch_geometric.typing import (
-    DEFAULT_REL,
     EdgeTensorType,
-    EdgeType,
     FeatureTensorType,
-    NodeOrEdgeType,
-    NodeType,
-    QueryType,
     SparseTensor,
     TensorFrame,
     torch_frame,
@@ -57,24 +54,51 @@ from torch_geometric.utils import (
     mask_select,
 )
 
-NodeOrEdgeStorage = Union[NodeStorage, EdgeStorage]
+
+# Datatypes
+# Taken from torch_geometric.typing
+
+# Node-types are denoted by a single string, e.g.: `data['paper']`:
+NodeType = str
+
+# Edge-types are denotes by a triplet of strings, e.g.:
+# `data[('author', 'writes', 'paper')]
+EdgeType = Tuple[str, str, str]
+
+NodeOrEdgeType = Union[NodeType, EdgeType]
+
+QueryType = Union[NodeType, EdgeType, str, Tuple[str, str]]
+
+DEFAULT_REL = "to"
+
 
 _DISPLAYED_TYPE_NAME_WARNING: bool = False
 
+# Formerly subclass of BaseData, FeatureStore, GraphStore
+class HeteroData():
+    r"""A plain old python object modeling a heterogeneous graph with multiple node
+        and/or edge types in disjunct storage objects.
+        Storage objects can hold either node-level, link-level or graph-level
+        attributes.
+        
+        HeteroData provides useful functionality for analyzing graph
+        structures and provides basic PyTorch tensor functionalities.
 
-[docs]class HeteroData(BaseData, FeatureStore, GraphStore):
-    r"""A data object describing a heterogeneous graph, holding multiple node
-    and/or edge types in disjunct storage objects.
-    Storage objects can hold either node-level, link-level or graph-level
-    attributes.
-    In general, :class:`~torch_geometric.data.HeteroData` tries to mimic the
-    behavior of a regular **nested** :python:`Python` dictionary.
-    In addition, it provides useful functionality for analyzing graph
-    structures, and provides basic PyTorch tensor functionalities.
+        Example::
+            TODO: this!
+            data = HeteroData(x=x, )
+    
+        NOTE:
+        - Basic functionality:
+            - data should function pretty much like a (nested) Python dict, with key-value pairs
+                being either node types or edge types
+            - data[key] <-- reference sub-dictionary with data on a node type
+            - data[x, relationship, y] <-- reference sub-dictionary with data on an edge type
+                ^ to make things simpler, could be just data["{x}_{relationship}_{y}"]
 
     .. code-block::
 
-        from torch_geometric.data import HeteroData
+        from cace.tools.torch_geometric.heterodata import HeteroData
 
         data = HeteroData()
 
@@ -139,11 +163,12 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         })
     """
     def __init__(self, _mapping: Optional[Dict[str, Any]] = None, **kwargs):
-        super().__init__()
 
-        self.__dict__['_global_store'] = BaseStorage(_parent=self)
-        self.__dict__['_node_store_dict'] = {}
-        self.__dict__['_edge_store_dict'] = {}
+        # NOTE: self.__dict__['_global_store'] = BaseStorage(_parent=self)
+
+        self.__dict__['_global_store'] = dict()
+        self.__dict__['_node_store_dict'] = dict()
+        self.__dict__['_edge_store_dict'] = dict()
 
         for key, value in chain((_mapping or {}).items(), kwargs.items()):
             if '__' in key and isinstance(value, Mapping):
@@ -154,22 +179,24 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             else:
                 setattr(self, key, value)
 
-[docs]    @classmethod
+    @classmethod
     def from_dict(cls, mapping: Dict[str, Any]) -> Self:
-        r"""Creates a :class:`~torch_geometric.data.HeteroData` object from a
-        dictionary.
+        r"""Creates a :class:`~cace.tools.torch_geometric.heterodata.HeteroData`
+            object from a dictionary.
         """
         out = cls()
+
+        # NOTE: key details about BaseStorage/NodeStorage/EdgeStorage:
+        #   - Ability to count number of nodes or have num_nodes be a feature
+        #   - Similarly, num_node_features/num_edge_features
+
         for key, value in mapping.items():
             if key == '_global_store':
-                out.__dict__['_global_store'] = BaseStorage(
-                    _parent=out, **value)
+                out.__dict__['_global_store'] = dict(value)
             elif isinstance(key, str):
-                out._node_store_dict[key] = NodeStorage(
-                    _parent=out, _key=key, **value)
+                out._node_store_dict[key] = dict(value)
             else:
-                out._edge_store_dict[key] = EdgeStorage(
-                    _parent=out, _key=key, **value)
+                out._edge_store_dict[key] = dict(value)
         return out
 
     def __getattr__(self, key: str) -> Any:
@@ -177,8 +204,8 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         # `data.*` => Link to the `_global_store`.
         # Using `data.*_dict` is the same as using `collect()` for collecting
         # nodes and edges features.
-        if hasattr(self._global_store, key):
-            return getattr(self._global_store, key)
+        if key in self._global_store:
+            return self._global_store[key]
         elif bool(re.search('_dict$', key)):
             return self.collect(key[:-5])
         raise AttributeError(f"'{self.__class__.__name__}' has no "
@@ -190,10 +217,12 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             raise AttributeError(f"'{key}' is already present as a node type")
         elif key in self.edge_types:
             raise AttributeError(f"'{key}' is already present as an edge type")
-        setattr(self._global_store, key, value)
+        
+        self._global_store[key] = value
 
     def __delattr__(self, key: str):
-        delattr(self._global_store, key)
+        if key in self._global_store:
+            del self._global_store[key]
 
     def __getitem__(self, *args: QueryType) -> Any:
         # `data[*]` => Link to either `_global_store`, _node_store_dict` or
@@ -211,6 +240,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         else:
             return self.get_node_store(key)
 
+    #TODO: you are here
     def __setitem__(self, key: str, value: Any):
         if key in self.node_types:
             raise AttributeError(f"'{key}' is already present as a node type")
@@ -296,15 +326,15 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         r"""Returns a list of all edge storages of the graph."""
         return list(self._edge_store_dict.values())
 
-[docs]    def node_items(self) -> List[Tuple[NodeType, NodeStorage]]:
+    def node_items(self) -> List[Tuple[NodeType, NodeStorage]]:
         r"""Returns a list of node type and node storage pairs."""
         return list(self._node_store_dict.items())
 
-[docs]    def edge_items(self) -> List[Tuple[EdgeType, EdgeStorage]]:
+    def edge_items(self) -> List[Tuple[EdgeType, EdgeStorage]]:
         r"""Returns a list of edge type and edge storage pairs."""
         return list(self._edge_store_dict.items())
 
-[docs]    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         out_dict: Dict[str, Any] = {}
         out_dict['_global_store'] = self._global_store.to_dict()
         for key, store in chain(self._node_store_dict.items(),
@@ -312,7 +342,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             out_dict[key] = store.to_dict()
         return out_dict
 
-[docs]    def to_namedtuple(self) -> NamedTuple:
+    def to_namedtuple(self) -> NamedTuple:
         field_names = list(self._global_store.keys())
         field_values = list(self._global_store.values())
         field_names += [
@@ -326,7 +356,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         DataTuple = namedtuple('DataTuple', field_names)
         return DataTuple(*field_values)
 
-[docs]    def set_value_dict(
+    def set_value_dict(
         self,
         key: str,
         value_dict: Dict[str, Any],
@@ -350,13 +380,13 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             self[k][key] = v
         return self
 
-[docs]    def update(self, data: Self) -> Self:
+    def update(self, data: Self) -> Self:
         for store in data.stores:
             for key, value in store.items():
                 self[store._key][key] = value
         return self
 
-[docs]    def __cat_dim__(self, key: str, value: Any,
+    def __cat_dim__(self, key: str, value: Any,
                     store: Optional[NodeOrEdgeStorage] = None, *args,
                     **kwargs) -> Any:
         if is_sparse(value) and ('adj' in key or 'edge_index' in key):
@@ -365,7 +395,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             return -1
         return 0
 
-[docs]    def __inc__(self, key: str, value: Any,
+    def __inc__(self, key: str, value: Any,
                 store: Optional[NodeOrEdgeStorage] = None, *args,
                 **kwargs) -> Any:
         if 'batch' in key and isinstance(value, Tensor):
@@ -405,17 +435,17 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             for key, store in self._edge_store_dict.items()
         }
 
-[docs]    def has_isolated_nodes(self) -> bool:
+    def has_isolated_nodes(self) -> bool:
         r"""Returns :obj:`True` if the graph contains isolated nodes."""
         edge_index, _, _ = to_homogeneous_edge_index(self)
         return contains_isolated_nodes(edge_index, num_nodes=self.num_nodes)
 
-[docs]    def is_undirected(self) -> bool:
+    def is_undirected(self) -> bool:
         r"""Returns :obj:`True` if graph edges are undirected."""
         edge_index, _, _ = to_homogeneous_edge_index(self)
         return is_undirected(edge_index, num_nodes=self.num_nodes)
 
-[docs]    def validate(self, raise_on_error: bool = True) -> bool:
+    def validate(self, raise_on_error: bool = True) -> bool:
         r"""Validates the correctness of the data."""
         cls_name = self.__class__.__name__
         status = True
@@ -536,7 +566,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
 
         return args
 
-[docs]    def metadata(self) -> Tuple[List[NodeType], List[EdgeType]]:
+    def metadata(self) -> Tuple[List[NodeType], List[EdgeType]]:
         r"""Returns the heterogeneous meta-data, *i.e.* its node and edge
         types.
 
@@ -552,7 +582,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         """
         return self.node_types, self.edge_types
 
-[docs]    def collect(
+    def collect(
         self,
         key: str,
         allow_empty: bool = False,
@@ -581,8 +611,8 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         mapping = {}
         for subtype, store in chain(self._node_store_dict.items(),
                                     self._edge_store_dict.items()):
-            if hasattr(store, key):
-                mapping[subtype] = getattr(store, key)
+            if key in store:
+                mapping[subtype] = store[key]
         if not allow_empty and len(mapping) == 0:
             raise KeyError(f"Tried to collect '{key}' but did not find any "
                            f"occurrences of it in any node and/or edge type")
@@ -599,12 +629,10 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
                           f"issues, ensure that your type names only contain "
                           f"single underscores.")
 
-[docs]    def get_node_store(self, key: NodeType) -> NodeStorage:
-        r"""Gets the :class:`~torch_geometric.data.storage.NodeStorage` object
-        of a particular node type :attr:`key`.
-        If the storage is not present yet, will create a new
-        :class:`torch_geometric.data.storage.NodeStorage` object for the given
-        node type.
+    def get_node_store(self, key: NodeType) -> Dict[str, Any]:
+        r"""Gets the dict associated with a particular node type :attr:`key`.
+            If the dict is not present yet, this function will create a new
+            dict for the given node type.
 
         .. code-block:: python
 
@@ -614,16 +642,14 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         out = self._node_store_dict.get(key, None)
         if out is None:
             self._check_type_name(key)
-            out = NodeStorage(_parent=self, _key=key)
+            out = dict()
             self._node_store_dict[key] = out
         return out
 
-[docs]    def get_edge_store(self, src: str, rel: str, dst: str) -> EdgeStorage:
-        r"""Gets the :class:`~torch_geometric.data.storage.EdgeStorage` object
-        of a particular edge type given by the tuple :obj:`(src, rel, dst)`.
-        If the storage is not present yet, will create a new
-        :class:`torch_geometric.data.storage.EdgeStorage` object for the given
-        edge type.
+    def get_edge_store(self, src: str, rel: str, dst: str) -> Dict[str, Any]:
+        r"""Gets the dict associated with a particular edge type given by the
+           type :obj:`(src, rel, dst)`. If the dict is not present yet, this 
+           function will create a new dict for the given edge type.
 
         .. code-block:: python
 
@@ -634,11 +660,11 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
         out = self._edge_store_dict.get(key, None)
         if out is None:
             self._check_type_name(rel)
-            out = EdgeStorage(_parent=self, _key=key)
+            out = dict()
             self._edge_store_dict[key] = out
         return out
 
-[docs]    def rename(self, name: NodeType, new_name: NodeType) -> Self:
+    def rename(self, name: NodeType, new_name: NodeType) -> Self:
         r"""Renames the node type :obj:`name` to :obj:`new_name` in-place."""
         node_store = self._node_store_dict.pop(name)
         node_store._key = new_name
@@ -656,7 +682,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
 
         return self
 
-[docs]    def subgraph(self, subset_dict: Dict[NodeType, Tensor]) -> Self:
+    def subgraph(self, subset_dict: Dict[NodeType, Tensor]) -> Self:
         r"""Returns the induced subgraph containing the node types and
         corresponding nodes in :obj:`subset_dict`.
 
@@ -747,7 +773,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
 
         return data
 
-[docs]    def edge_subgraph(
+    def edge_subgraph(
         self,
         subset_dict: Dict[EdgeType, Tensor],
     ) -> Self:
@@ -774,7 +800,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
 
         return data
 
-[docs]    def node_type_subgraph(self, node_types: List[NodeType]) -> Self:
+    def node_type_subgraph(self, node_types: List[NodeType]) -> Self:
         r"""Returns the subgraph induced by the given :obj:`node_types`, *i.e.*
         the returned :class:`HeteroData` object only contains the node types
         which are included in :obj:`node_types`, and only contains the edge
@@ -790,7 +816,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
                 del data[node_type]
         return data
 
-[docs]    def edge_type_subgraph(self, edge_types: List[EdgeType]) -> Self:
+    def edge_type_subgraph(self, edge_types: List[EdgeType]) -> Self:
         r"""Returns the subgraph induced by the given :obj:`edge_types`, *i.e.*
         the returned :class:`HeteroData` object only contains the edge types
         which are included in :obj:`edge_types`, and only contains the node
@@ -809,7 +835,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
                 del data[node_type]
         return data
 
-[docs]    def to_homogeneous(
+    def to_homogeneous(
         self,
         node_attrs: Optional[List[str]] = None,
         edge_attrs: Optional[List[str]] = None,
@@ -1052,7 +1078,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
     def _get_tensor_size(self, attr: TensorAttr) -> Tuple:
         return self._get_tensor(attr).size()
 
-[docs]    def get_all_tensor_attrs(self) -> List[TensorAttr]:
+    def get_all_tensor_attrs(self) -> List[TensorAttr]:
         out = []
         for group_name, group in self.node_items():
             for attr_name in group:
@@ -1133,7 +1159,7 @@ _DISPLAYED_TYPE_NAME_WARNING: bool = False
             return True
         return False
 
-[docs]    def get_all_edge_attrs(self) -> List[EdgeAttr]:
+    def get_all_edge_attrs(self) -> List[EdgeAttr]:
         edge_attrs = getattr(self, '_edge_attrs', {})
 
         for store in self.edge_stores:
