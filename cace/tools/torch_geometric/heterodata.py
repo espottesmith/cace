@@ -240,7 +240,6 @@ class HeteroData():
         else:
             return self.get_node_store(key)
 
-    #TODO: you are here
     def __setitem__(self, key: str, value: Any):
         if key in self.node_types:
             raise AttributeError(f"'{key}' is already present as a node type")
@@ -263,26 +262,26 @@ class HeteroData():
         for key, value in self.__dict__.items():
             out.__dict__[key] = value
         out.__dict__['_global_store'] = copy.copy(self._global_store)
-        out._global_store._parent = out
+        # out._global_store._parent = out
         out.__dict__['_node_store_dict'] = {}
         for key, store in self._node_store_dict.items():
             out._node_store_dict[key] = copy.copy(store)
-            out._node_store_dict[key]._parent = out
+            # out._node_store_dict[key]._parent = out
         out.__dict__['_edge_store_dict'] = {}
         for key, store in self._edge_store_dict.items():
             out._edge_store_dict[key] = copy.copy(store)
-            out._edge_store_dict[key]._parent = out
+            # out._edge_store_dict[key]._parent = out
         return out
 
     def __deepcopy__(self, memo):
         out = self.__class__.__new__(self.__class__)
         for key, value in self.__dict__.items():
             out.__dict__[key] = copy.deepcopy(value, memo)
-        out._global_store._parent = out
-        for key in self._node_store_dict.keys():
-            out._node_store_dict[key]._parent = out
-        for key in out._edge_store_dict.keys():
-            out._edge_store_dict[key]._parent = out
+        # out._global_store._parent = out
+        # for key in self._node_store_dict.keys():
+        #     out._node_store_dict[key]._parent = out
+        # for key in out._edge_store_dict.keys():
+        #     out._edge_store_dict[key]._parent = out
         return out
 
     def __repr__(self) -> str:
@@ -293,6 +292,8 @@ class HeteroData():
         info = f'\n{info}\n' if len(info) > 0 else info
         return f'{self.__class__.__name__}({info})'
 
+    # Not sure what the point of this is?
+    # Do we need this?
     def stores_as(self, data: Self):
         for node_type in data.node_types:
             self.get_node_store(node_type)
@@ -301,7 +302,7 @@ class HeteroData():
         return self
 
     @property
-    def stores(self) -> List[BaseStorage]:
+    def stores(self) -> List[Dict[str, Any]]:
         r"""Returns a list of all storages of the graph."""
         return ([self._global_store] + list(self.node_stores) +
                 list(self.edge_stores))
@@ -312,7 +313,7 @@ class HeteroData():
         return list(self._node_store_dict.keys())
 
     @property
-    def node_stores(self) -> List[NodeStorage]:
+    def node_stores(self) -> List[Dict[str, Any]]:
         r"""Returns a list of all node storages of the graph."""
         return list(self._node_store_dict.values())
 
@@ -322,26 +323,27 @@ class HeteroData():
         return list(self._edge_store_dict.keys())
 
     @property
-    def edge_stores(self) -> List[EdgeStorage]:
+    def edge_stores(self) -> List[Dict[str, Any]]:
         r"""Returns a list of all edge storages of the graph."""
         return list(self._edge_store_dict.values())
 
-    def node_items(self) -> List[Tuple[NodeType, NodeStorage]]:
+    def node_items(self) -> List[Tuple[NodeType, Dict[str, Any]]]:
         r"""Returns a list of node type and node storage pairs."""
         return list(self._node_store_dict.items())
 
-    def edge_items(self) -> List[Tuple[EdgeType, EdgeStorage]]:
+    def edge_items(self) -> List[Tuple[EdgeType, Dict[str, Any]]]:
         r"""Returns a list of edge type and edge storage pairs."""
         return list(self._edge_store_dict.items())
 
     def to_dict(self) -> Dict[str, Any]:
         out_dict: Dict[str, Any] = {}
-        out_dict['_global_store'] = self._global_store.to_dict()
+        out_dict['_global_store'] = dict(self._global_store)
         for key, store in chain(self._node_store_dict.items(),
                                 self._edge_store_dict.items()):
-            out_dict[key] = store.to_dict()
+            out_dict[key] = dict(store)
         return out_dict
 
+    # TODO: you are here
     def to_namedtuple(self) -> NamedTuple:
         field_names = list(self._global_store.keys())
         field_values = list(self._global_store.values())
