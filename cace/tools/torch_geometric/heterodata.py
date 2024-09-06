@@ -34,25 +34,35 @@ from cace.tools.torch_geometric.data import size_repr  # see torch_geometric.dat
 
 # TODO: what do we need from here, and what can we get rid of
 # Try to include only the minimal subset of code from pytorch_geometric
-from torch_geometric import Index
 from torch_geometric.data import EdgeAttr, FeatureStore, GraphStore, TensorAttr
 from torch_geometric.data.data import warn_or_raise
 from torch_geometric.data.graph_store import EdgeLayout
-from torch_geometric.data.storage import BaseStorage, EdgeStorage, NodeStorage
 from torch_geometric.typing import (
     EdgeTensorType,
     FeatureTensorType,
-    SparseTensor,
-    TensorFrame,
-    torch_frame,
 )
 from torch_geometric.utils import (
     bipartite_subgraph,
     contains_isolated_nodes,
-    is_sparse,
     is_undirected,
     mask_select,
 )
+
+from cace.tools.torch_geometric.utils import (
+    SparseTensor,
+    is_sparse
+)
+
+# NOTE: key details about BaseStorage/NodeStorage/EdgeStorage:
+#   - Ability to count number of nodes or have num_nodes be a feature
+#   - Similarly, num_node_features/num_edge_features
+
+
+# Global variables
+_DISPLAYED_TYPE_NAME_WARNING: bool = False
+
+N_KEYS = {'x', 'feat', 'pos', 'batch', 'node_type', 'n_id'}
+E_KEYS = {'edge_index', 'edge_weight', 'edge_attr', 'edge_type', 'e_id'}
 
 
 # Datatypes
@@ -72,10 +82,83 @@ QueryType = Union[NodeType, EdgeType, str, Tuple[str, str]]
 DEFAULT_REL = "to"
 
 
-_DISPLAYED_TYPE_NAME_WARNING: bool = False
+# Misc. functions
+
+def can_infer_num_nodes_from_node_store(store: Dict[str, Any]) -> bool:
+    keys = set(store.keys())
+    num_node_keys = {
+        'num_nodes', 'x', 'pos', 'batch', 'adj', 'adj_t', 'edge_index',
+        'face'
+    }
+    if len(keys & num_node_keys) > 0:
+        return True
+    elif len([key for key in keys if 'node' in key]) > 0:
+        return True
+    else:
+        return False
+
+def num_nodes_from_node_store(store: Dict[str, Any]) -> Optional[int]:
+    if "num_nodes" in store:
+        return store["num_nodes"]
+    for key, value in store.items():
+        if isinstance(value, Tensor) and key in N_KEYS:
+            cat_dim = store["_parent"].__cat_dim__(key, value, is_edge=False)
+            return value.size(cat_dim)
+        if isinstance(value, np.ndarray) and key in N_KEYS:
+            cat_dim = self["_parent"].__cat_dim__(key, value, is_edge=False)
+            return value.shape[cat_dim]
+    for key, value in self.items():
+        if isinstance(value, Tensor) and 'node' in key:
+            cat_dim = self._parent().__cat_dim__(key, value, self)
+            return value.size(cat_dim)
+        if isinstance(value, np.ndarray) and 'node' in key:
+            cat_dim = self._parent().__cat_dim__(key, value, self)
+            return value.shape[cat_dim]
+    if 'adj' in store and isinstance(store["adj"], (Tensor, SparseTensor)):
+        return store["adj"].size(0)
+    if 'adj_t' in store and isinstance(store["adj_t"], (Tensor, SparseTensor)):
+        return store["adj_t"].size(1)
+    warnings.warn(
+        f"Unable to accurately infer 'num_nodes' from the attribute set "
+        f"'{set(store.keys())}'. Please explicitly set 'num_nodes' as an "
+        f"attribute of " +
+        ("'data'" if store['_key'] is None else f"'data[{store["_key"]}]'") +
+        " to suppress this warning")
+    if 'edge_index' in store and isinstance(store["edge_index"], Tensor):
+        if store["edge_index"].numel() > 0:
+            return int(store["edge_index"].max()) + 1
+        return 0
+    if 'face' in store and isinstance(store["face"], Tensor):
+        if store["face"].numel() > 0:
+            return int(store["face"].max()) + 1
+        return 0
+    return None
+
+def num_node_features_from_node_store(store: Dict[str, Any]) -> int:
+    x: Optional[Any] = store.get('x')
+    if isinstance(x, Tensor):
+        return 1 if x.dim() == 1 else x.size(-1)
+    if isinstance(x, np.ndarray):
+        return 1 if x.ndim == 1 else x.shape[-1]
+    if isinstance(x, SparseTensor):
+        return 1 if x.dim() == 1 else x.size(-1)
+
+    return 0
+
+#TODO: you are here
+def num_edge_features_from_edge_store(store: Dict[str, Any]) -> int:
+    edge_attr: Optional[Any] = self.get('edge_attr')
+    if isinstance(edge_attr, Tensor):
+        return 1 if edge_attr.dim() == 1 else edge_attr.size(-1)
+    if isinstance(edge_attr, np.ndarray):
+        return 1 if edge_attr.ndim == 1 else edge_attr.shape[-1]
+    if isinstance(edge_attr, TensorFrame):
+        return edge_attr.num_cols
+    return 0
+
 
 # Formerly subclass of BaseData, FeatureStore, GraphStore
-class HeteroData():
+class HeteroData(object):
     r"""A plain old python object modeling a heterogeneous graph with multiple node
         and/or edge types in disjunct storage objects.
         Storage objects can hold either node-level, link-level or graph-level
@@ -166,9 +249,13 @@ class HeteroData():
 
         # NOTE: self.__dict__['_global_store'] = BaseStorage(_parent=self)
 
-        self.__dict__['_global_store'] = dict()
-        self.__dict__['_node_store_dict'] = dict()
-        self.__dict__['_edge_store_dict'] = dict()
+        self._global_store = dict()
+        self.node_stores = dict()
+        self.edge_stores = dict()
+
+        # self.__dict__['_global_store'] = dict()
+        # self.__dict__['_node_store_dict'] = dict()
+        # self.__dict__['_edge_store_dict'] = dict()
 
         for key, value in chain((_mapping or {}).items(), kwargs.items()):
             if '__' in key and isinstance(value, Mapping):
@@ -186,17 +273,18 @@ class HeteroData():
         """
         out = cls()
 
-        # NOTE: key details about BaseStorage/NodeStorage/EdgeStorage:
-        #   - Ability to count number of nodes or have num_nodes be a feature
-        #   - Similarly, num_node_features/num_edge_features
-
         for key, value in mapping.items():
             if key == '_global_store':
-                out.__dict__['_global_store'] = dict(value)
+                out._global_store = dict(value)
+                out._global_store["_parent"] = out
             elif isinstance(key, str):
-                out._node_store_dict[key] = dict(value)
+                out.node_stores[key] = dict(value)
+                out.node_stores[key]["_parent"] = out
+                out.node_stores[key]["_key"] = key
             else:
-                out._edge_store_dict[key] = dict(value)
+                out.edge_stores[key] = dict(value)
+                out.edge_stores[key]["_parent"] = out
+                out.edge_stores[key]["_key"] = key
         return out
 
     def __getattr__(self, key: str) -> Any:
@@ -225,9 +313,9 @@ class HeteroData():
             del self._global_store[key]
 
     def __getitem__(self, *args: QueryType) -> Any:
-        # `data[*]` => Link to either `_global_store`, _node_store_dict` or
-        # `_edge_store_dict`.
-        # If neither is present, we create a new `Storage` object for the given
+        # `data[*]` => Link to either `_global_store`, node_stores` or
+        # `edge_stores`.
+        # If neither is present, we create a new storage dictionary for the given
         # node/edge-type.
         key = self._to_canonical(*args)
 
@@ -251,9 +339,9 @@ class HeteroData():
         # `del data[*]` => Link to `_node_store_dict` or `_edge_store_dict`.
         key = self._to_canonical(*args)
         if key in self.edge_types:
-            del self._edge_store_dict[key]
+            del self.edge_stores[key]
         elif key in self.node_types:
-            del self._node_store_dict[key]
+            del self.node_stores[key]
         else:
             del self._global_store[key]
 
@@ -262,88 +350,73 @@ class HeteroData():
         for key, value in self.__dict__.items():
             out.__dict__[key] = value
         out.__dict__['_global_store'] = copy.copy(self._global_store)
-        # out._global_store._parent = out
-        out.__dict__['_node_store_dict'] = {}
-        for key, store in self._node_store_dict.items():
-            out._node_store_dict[key] = copy.copy(store)
-            # out._node_store_dict[key]._parent = out
-        out.__dict__['_edge_store_dict'] = {}
-        for key, store in self._edge_store_dict.items():
-            out._edge_store_dict[key] = copy.copy(store)
-            # out._edge_store_dict[key]._parent = out
+        out._global_store["_parent"] = out
+        out.__dict__['node_stores'] = {}
+        for key, store in self.node_stores.items():
+            out.node_stores[key] = copy.copy(store)
+            out.node_stores[key]["_parent"] = out
+            out.node_stores[key]["_key"] = key
+        out.__dict__['edge_stores'] = {}
+        for key, store in self.edge_stores.items():
+            out.edge_stores[key] = copy.copy(store)
+            out.edge_stores[key]["_parent"] = out
+            out.edge_stores[key]["_key"] = key
         return out
 
     def __deepcopy__(self, memo):
         out = self.__class__.__new__(self.__class__)
         for key, value in self.__dict__.items():
             out.__dict__[key] = copy.deepcopy(value, memo)
-        # out._global_store._parent = out
-        # for key in self._node_store_dict.keys():
-        #     out._node_store_dict[key]._parent = out
-        # for key in out._edge_store_dict.keys():
-        #     out._edge_store_dict[key]._parent = out
+        out._global_store["_parent"] = out
+        for key in self.node_stores.keys():
+            out.node_stores[key]["_parent"] = out
+            out.node_stores[key]["_key"] = key
+        for key in out._edge_store_dict.keys():
+            out.edge_stores[key]["_parent"] = out
+            out.edge_stores[key]["_key"] = key
         return out
 
     def __repr__(self) -> str:
         info1 = [size_repr(k, v, 2) for k, v in self._global_store.items()]
-        info2 = [size_repr(k, v, 2) for k, v in self._node_store_dict.items()]
-        info3 = [size_repr(k, v, 2) for k, v in self._edge_store_dict.items()]
+        info2 = [size_repr(k, v, 2) for k, v in self.node_stores.items()]
+        info3 = [size_repr(k, v, 2) for k, v in self.edge_stores.items()]
         info = ',\n'.join(info1 + info2 + info3)
         info = f'\n{info}\n' if len(info) > 0 else info
         return f'{self.__class__.__name__}({info})'
 
-    # Not sure what the point of this is?
+    # TODO: Not sure what the point of this is?
     # Do we need this?
-    def stores_as(self, data: Self):
-        for node_type in data.node_types:
-            self.get_node_store(node_type)
-        for edge_type in data.edge_types:
-            self.get_edge_store(*edge_type)
-        return self
+    # def stores_as(self, data: Self):
+    #     for node_type in data.node_types:
+    #         self.get_node_store(node_type)
+    #     for edge_type in data.edge_types:
+    #         self.get_edge_store(*edge_type)
+    #     return self
 
     @property
     def stores(self) -> List[Dict[str, Any]]:
         r"""Returns a list of all storages of the graph."""
-        return ([self._global_store] + list(self.node_stores) +
-                list(self.edge_stores))
+        return ([self._global_store] + list(self.node_stores.values()) +
+                list(self.edge_stores.values()))
 
     @property
     def node_types(self) -> List[NodeType]:
         r"""Returns a list of all node types of the graph."""
-        return list(self._node_store_dict.keys())
-
-    @property
-    def node_stores(self) -> List[Dict[str, Any]]:
-        r"""Returns a list of all node storages of the graph."""
-        return list(self._node_store_dict.values())
+        return list(self.node_stores.keys())
 
     @property
     def edge_types(self) -> List[EdgeType]:
         r"""Returns a list of all edge types of the graph."""
-        return list(self._edge_store_dict.keys())
-
-    @property
-    def edge_stores(self) -> List[Dict[str, Any]]:
-        r"""Returns a list of all edge storages of the graph."""
-        return list(self._edge_store_dict.values())
-
-    def node_items(self) -> List[Tuple[NodeType, Dict[str, Any]]]:
-        r"""Returns a list of node type and node storage pairs."""
-        return list(self._node_store_dict.items())
-
-    def edge_items(self) -> List[Tuple[EdgeType, Dict[str, Any]]]:
-        r"""Returns a list of edge type and edge storage pairs."""
-        return list(self._edge_store_dict.items())
+        return list(self.edge_stores.keys())
 
     def to_dict(self) -> Dict[str, Any]:
         out_dict: Dict[str, Any] = {}
         out_dict['_global_store'] = dict(self._global_store)
-        for key, store in chain(self._node_store_dict.items(),
-                                self._edge_store_dict.items()):
+        for key, store in chain(self.node_stores.items(),
+                                self.edge_stores.items()):
             out_dict[key] = dict(store)
         return out_dict
 
-    # TODO: you are here
     def to_namedtuple(self) -> NamedTuple:
         field_names = list(self._global_store.keys())
         field_values = list(self._global_store.values())
@@ -351,10 +424,15 @@ class HeteroData():
             '__'.join(key) if isinstance(key, tuple) else key
             for key in self.node_types + self.edge_types
         ]
-        field_values += [
-            store.to_namedtuple()
-            for store in self.node_stores + self.edge_stores
-        ]
+
+        for store_name, store_data in chain(
+            self.node_stores.items(), self.edge_stores.items()
+        ):
+            store_field_names = list(store_data.keys())
+            store_field_values = list(store_data.values())
+            StoreTuple = namedtuple(store_name, store_field_names)
+            field_values.append(StoreTuple(*store_field_values))
+
         DataTuple = namedtuple('DataTuple', field_names)
         return DataTuple(*field_values)
 
@@ -382,29 +460,50 @@ class HeteroData():
             self[k][key] = v
         return self
 
-    def update(self, data: Self) -> Self:
-        for store in data.stores:
-            for key, value in store.items():
-                self[store._key][key] = value
-        return self
+    # TODO: another "I don't get it" function
+    # Maybe only relevant if we were using the Store types?
+    # def update(self, data: Self) -> Self:
+    #     for store in data.stores:
+    #         for key, value in store.items():
+    #             self[store._key][key] = value
+    #     return self
 
-    def __cat_dim__(self, key: str, value: Any,
-                    store: Optional[NodeOrEdgeStorage] = None, *args,
-                    **kwargs) -> Any:
+    # TODO: think about the linear algebra of this
+    # Does this need to change with the dict vs. Store structure?
+    # Probably not...
+    def __cat_dim__(
+        self,
+        key: str,
+        value: Any,
+        is_edge: Optional[bool] = None,
+        *args,
+        **kwargs
+    ) -> Any:
         if is_sparse(value) and ('adj' in key or 'edge_index' in key):
             return (0, 1)
-        elif isinstance(store, EdgeStorage) and 'index' in key:
+        # elif isinstance(store, EdgeStorage) and 'index' in key:
+        elif is_edge and 'index' in key:
             return -1
         return 0
 
-    def __inc__(self, key: str, value: Any,
-                store: Optional[NodeOrEdgeStorage] = None, *args,
-                **kwargs) -> Any:
-        if 'batch' in key and isinstance(value, Tensor):
-            if isinstance(value, Index):
-                return value.get_dim_size()
-            return int(value.max()) + 1
-        elif isinstance(store, EdgeStorage) and 'index' in key:
+    #TODO: return to this
+    # Incrementing behavior for batching
+    # Not sure what general behavior should be
+    def __inc__(
+        self,
+        key: str,
+        value: Any,
+        store: Optional[Dict[str, Any]] = None,
+        is_edge: Optional[bool] = None,
+        *args,
+        **kwargs
+    ) -> Any:
+        # Following Data, try to avoid Index class
+        # if 'batch' in key and isinstance(value, Tensor):
+        #     if isinstance(value, Index):
+        #         return value.get_dim_size()
+        #     return int(value.max()) + 1
+        if store is not None and is_edge and 'index' in key:
             return torch.tensor(store.size()).view(2, 1)
         else:
             return 0
@@ -412,14 +511,17 @@ class HeteroData():
     @property
     def num_nodes(self) -> Optional[int]:
         r"""Returns the number of nodes in the graph."""
-        return super().num_nodes
+        if hasattr(self, "__num_nodes__"):
+            return self.__num_nodes__
+        
+        return sum([num_nodes_from_node_store(v) for v in self.node_stores.values()])
 
     @property
     def num_node_features(self) -> Dict[NodeType, int]:
         r"""Returns the number of features per node type in the graph."""
         return {
-            key: store.num_node_features
-            for key, store in self._node_store_dict.items()
+            key: num_node_features_from_node_store(store)
+            for key, store in self.node_stores.items()
         }
 
     @property
@@ -433,8 +535,8 @@ class HeteroData():
     def num_edge_features(self) -> Dict[EdgeType, int]:
         r"""Returns the number of features per edge type in the graph."""
         return {
-            key: store.num_edge_features
-            for key, store in self._edge_store_dict.items()
+            key: num_edge_features_from_edge_store(store)
+            for key, store in self.edge_stores.items()
         }
 
     def has_isolated_nodes(self) -> bool:
@@ -610,9 +712,9 @@ class HeteroData():
                 an error in case the attribute does not exit in any node or
                 edge type. (default: :obj:`False`)
         """
-        mapping = {}
-        for subtype, store in chain(self._node_store_dict.items(),
-                                    self._edge_store_dict.items()):
+        mapping = dict()
+        for subtype, store in chain(self.node_stores.items(),
+                                    self.edge_stores.items()):
             if key in store:
                 mapping[subtype] = store[key]
         if not allow_empty and len(mapping) == 0:
@@ -641,11 +743,10 @@ class HeteroData():
             data = HeteroData()
             node_storage = data.get_node_store('paper')
         """
-        out = self._node_store_dict.get(key, None)
+        out = self.node_stores.get(key, None)
         if out is None:
             self._check_type_name(key)
-            out = dict()
-            self._node_store_dict[key] = out
+            self.node_stores[key] = dict()
         return out
 
     def get_edge_store(self, src: str, rel: str, dst: str) -> Dict[str, Any]:
@@ -659,11 +760,10 @@ class HeteroData():
             edge_storage = data.get_edge_store('author', 'writes', 'paper')
         """
         key = (src, rel, dst)
-        out = self._edge_store_dict.get(key, None)
+        out = self.edge_stores.get(key, None)
         if out is None:
             self._check_type_name(rel)
-            out = dict()
-            self._edge_store_dict[key] = out
+            self.edge_stores[key] = dict()
         return out
 
     def rename(self, name: NodeType, new_name: NodeType) -> Self:
@@ -945,24 +1045,6 @@ class HeteroData():
                     continue
                 keys.append(key)
 
-            # Check for consistent column names in `TensorFrame`:
-            tf_cols = defaultdict(list)
-            for store in stores:
-                for key, value in store.items():
-                    if isinstance(value, TensorFrame):
-                        cols = tuple(chain(*value.col_names_dict.values()))
-                        tf_cols[key].append(cols)
-
-            for key, cols in tf_cols.items():
-                # The attribute needs to exist in all types:
-                if len(cols) != len(stores):
-                    continue
-                # The attributes needs to have the same column names:
-                lengths = set(cols)
-                if len(lengths) != 1:
-                    continue
-                keys.append(key)
-
             return keys
 
         if dummy_values:
@@ -986,21 +1068,18 @@ class HeteroData():
             if key in {'ptr'}:
                 continue
             values = [store[key] for store in self.node_stores]
-            if isinstance(values[0], TensorFrame):
-                value = torch_frame.cat(values, dim=0)
-            else:
-                dim = self.__cat_dim__(key, values[0], self.node_stores[0])
-                dim = values[0].dim() + dim if dim < 0 else dim
-                # For two-dimensional features, we allow arbitrary shapes and
-                # pad them with zeros if necessary in case their size doesn't
-                # match:
-                if values[0].dim() == 2 and dim == 0:
-                    _max = max([value.size(-1) for value in values])
-                    for i, v in enumerate(values):
-                        if v.size(-1) < _max:
-                            pad = v.new_zeros(v.size(0), _max - v.size(-1))
-                            values[i] = torch.cat([v, pad], dim=-1)
-                value = torch.cat(values, dim)
+            dim = self.__cat_dim__(key, values[0], self.node_stores[0])
+            dim = values[0].dim() + dim if dim < 0 else dim
+            # For two-dimensional features, we allow arbitrary shapes and
+            # pad them with zeros if necessary in case their size doesn't
+            # match:
+            if values[0].dim() == 2 and dim == 0:
+                _max = max([value.size(-1) for value in values])
+                for i, v in enumerate(values):
+                    if v.size(-1) < _max:
+                        pad = v.new_zeros(v.size(0), _max - v.size(-1))
+                        values[i] = torch.cat([v, pad], dim=-1)
+            value = torch.cat(values, dim)
             data[key] = value
 
         if not data.can_infer_num_nodes:
