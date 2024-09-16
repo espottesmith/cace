@@ -43,14 +43,14 @@ from torch_geometric.typing import (
 )
 from torch_geometric.utils import (
     bipartite_subgraph,
-    contains_isolated_nodes,
     is_undirected,
     mask_select,
 )
 
 from cace.tools.torch_geometric.utils import (
     SparseTensor,
-    is_sparse
+    is_sparse,
+    contains_isolated_nodes
 )
 
 # NOTE: key details about BaseStorage/NodeStorage/EdgeStorage:
@@ -97,6 +97,7 @@ def can_infer_num_nodes_from_node_store(store: Dict[str, Any]) -> bool:
     else:
         return False
 
+
 def num_nodes_from_node_store(store: Dict[str, Any]) -> Optional[int]:
     if "num_nodes" in store:
         return store["num_nodes"]
@@ -134,6 +135,7 @@ def num_nodes_from_node_store(store: Dict[str, Any]) -> Optional[int]:
         return 0
     return None
 
+
 def num_node_features_from_node_store(store: Dict[str, Any]) -> int:
     x: Optional[Any] = store.get('x')
     if isinstance(x, Tensor):
@@ -145,15 +147,13 @@ def num_node_features_from_node_store(store: Dict[str, Any]) -> int:
 
     return 0
 
-#TODO: you are here
+
 def num_edge_features_from_edge_store(store: Dict[str, Any]) -> int:
-    edge_attr: Optional[Any] = self.get('edge_attr')
+    edge_attr: Optional[Any] = store.get('edge_attr')
     if isinstance(edge_attr, Tensor):
         return 1 if edge_attr.dim() == 1 else edge_attr.size(-1)
     if isinstance(edge_attr, np.ndarray):
         return 1 if edge_attr.ndim == 1 else edge_attr.shape[-1]
-    if isinstance(edge_attr, TensorFrame):
-        return edge_attr.num_cols
     return 0
 
 
@@ -539,11 +539,21 @@ class HeteroData(object):
             for key, store in self.edge_stores.items()
         }
 
+    @property
+    def num_nodes_dict(self) -> Dict[NodeType, int]:
+        """Returns the number of each type of node in the graph."""
+        num_nodes_dict = dict()
+        for node_type, node_store in self.node_stores.items():
+            num_nodes_dict[node_type] = num_nodes_from_node_store(node_store)
+        
+        return num_nodes_dict
+
     def has_isolated_nodes(self) -> bool:
         r"""Returns :obj:`True` if the graph contains isolated nodes."""
         edge_index, _, _ = to_homogeneous_edge_index(self)
         return contains_isolated_nodes(edge_index, num_nodes=self.num_nodes)
 
+    # TODO: you are here
     def is_undirected(self) -> bool:
         r"""Returns :obj:`True` if graph edges are undirected."""
         edge_index, _, _ = to_homogeneous_edge_index(self)
