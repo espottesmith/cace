@@ -42,15 +42,16 @@ from torch_geometric.typing import (
     FeatureTensorType,
 )
 from torch_geometric.utils import (
-    bipartite_subgraph,
-    is_undirected,
     mask_select,
 )
 
 from cace.tools.torch_geometric.utils import (
+    AttrType,
     SparseTensor,
     is_sparse,
-    contains_isolated_nodes
+    is_undirected,
+    contains_isolated_nodes,
+    bipartite_subgraph,
 )
 
 # NOTE: key details about BaseStorage/NodeStorage/EdgeStorage:
@@ -155,6 +156,89 @@ def num_edge_features_from_edge_store(store: Dict[str, Any]) -> int:
     if isinstance(edge_attr, np.ndarray):
         return 1 if edge_attr.ndim == 1 else edge_attr.shape[-1]
     return 0
+
+
+def is_node_attr(node_store: Dict[str, Any], key: str) -> bool:
+    if '_cached_attr' not in node_store:
+        node_store["_cached_attr"]: Dict[AttrType, Set[str]] = defaultdict(set)
+
+    if key in node_store["_cached_attr"][AttrType.NODE]:
+        return True
+    if key in node_store["_cached_attr"][AttrType.OTHER]:
+        return False
+
+    value = node_store.get(key)
+    if value is None:
+        return False
+
+    if (isinstance(value, (list, tuple))
+            and len(value) == node_store["num_nodes"]):
+        self._cached_attr[AttrType.NODE].add(key)
+        return True
+
+    if not isinstance(value, (Tensor, np.ndarray)):
+        node_store["_cached_attr"][AttrType.OTHER].add(key)
+        return False
+
+    if value.ndim == 0:
+        node_store["_cached_attr"][AttrType.OTHER].add(key)
+        return False
+
+    # TODO: make sure that _parent attribute is always set
+    cat_dim = node_store["_parent"].__cat_dim__(key, value, node_store)
+    if value.shape[cat_dim] != node_store["num_nodes"]:
+        node_store["_cached_attr"][AttrType.OTHER].add(key)
+        return False
+
+    self._cached_attr[AttrType.NODE].add(key)
+    return True
+
+
+def is_edge_attr(edge_store: Dict[str, Any], key: str) -> bool:
+    if '_cached_attr' not in edge_store:
+        edge_store["_cached_attr"] = defaultdict(set)
+
+    if key in edge_store["_cached_attr"][AttrType.EDGE]:
+        return True
+    if key in edge_store["_cached_attr"][AttrType.NODE]:
+        return False
+    if key in edge_store["_cached_attr"][AttrType.OTHER]:
+        return False
+
+    value = self[key]
+
+    if (isinstance(value, (list, tuple))
+            and len(value) == edge_store["num_edges"]):
+        edge_store["_cached_attr"][AttrType.EDGE].add(key)
+        return True
+
+    if not isinstance(value, (Tensor, np.ndarray)):
+        return False
+
+    if value.ndim == 0:
+        edge_store["_cached_attr"][AttrType.OTHER].add(key)
+        return False
+
+    cat_dim = edge_store["_parent"].__cat_dim__(key, value, edge_store)
+    num_nodes, num_edges = edge_store["num_nodes"], edge_store["num_edges"]
+
+    if value.shape[cat_dim] != num_edges:
+        if value.shape[cat_dim] == num_nodes:
+            edge_store["_cached_attr"][AttrType.NODE].add(key)
+        else:
+            edge_store["_cached_attr"][AttrType.OTHER].add(key)
+        return False
+
+    if num_edges != num_nodes:
+        edge_store["_cached_attr"][AttrType.EDGE].add(key)
+        return True
+
+    if 'edge' in key:
+        edge_store["_cached_attr"][AttrType.EDGE].add(key)
+        return True
+    else:
+        edge_store["_cached_attr"][AttrType.NODE].add(key)
+        return False
 
 
 # Formerly subclass of BaseData, FeatureStore, GraphStore
@@ -553,7 +637,6 @@ class HeteroData(object):
         edge_index, _, _ = to_homogeneous_edge_index(self)
         return contains_isolated_nodes(edge_index, num_nodes=self.num_nodes)
 
-    # TODO: you are here
     def is_undirected(self) -> bool:
         r"""Returns :obj:`True` if graph edges are undirected."""
         edge_index, _, _ = to_homogeneous_edge_index(self)
@@ -581,11 +664,11 @@ class HeteroData(object):
                 f"The node types {dangling_types} are isolated and are not "
                 f"referenced by any edge type ", raise_on_error=False)
 
-        for edge_type, store in self._edge_store_dict.items():
+        for edge_type, store in self.edge_stores.items():
             src, _, dst = edge_type
 
-            num_src_nodes = self[src].num_nodes
-            num_dst_nodes = self[dst].num_nodes
+            num_src_nodes = self.node_stores[src].get("num_nodes")
+            num_dst_nodes = self.node_stores[dst].get("num_nodes")
             if num_src_nodes is None:
                 status = False
                 warn_or_raise(
@@ -599,45 +682,46 @@ class HeteroData(object):
                     f"'{cls_name}'", raise_on_error)
 
             if 'edge_index' in store:
-                if (store.edge_index.dim() != 2
-                        or store.edge_index.size(0) != 2):
+                if (store["edge_index"].dim() != 2
+                        or store["edge_index"].size(0) != 2):
                     status = False
                     warn_or_raise(
                         f"'edge_index' of edge type {edge_type} needs to be "
                         f"of shape [2, num_edges] in '{cls_name}' (found "
-                        f"{store.edge_index.size()})", raise_on_error)
+                        f"{store["edge_index"].size()})", raise_on_error)
 
-            if 'edge_index' in store and store.edge_index.numel() > 0:
-                if store.edge_index.min() < 0:
+            if 'edge_index' in store and store["edge_index"].numel() > 0:
+                if store["edge_index"].min() < 0:
                     status = False
                     warn_or_raise(
                         f"'edge_index' of edge type {edge_type} contains "
                         f"negative indices in '{cls_name}' "
-                        f"(found {int(store.edge_index.min())})",
+                        f"(found {int(store["edge_index"].min())})",
                         raise_on_error)
 
                 if (num_src_nodes is not None
-                        and store.edge_index[0].max() >= num_src_nodes):
+                        and store["edge_index"][0].max() >= num_src_nodes):
                     status = False
                     warn_or_raise(
                         f"'edge_index' of edge type {edge_type} contains "
                         f"larger source indices than the number of nodes "
                         f"({num_src_nodes}) of this node type in '{cls_name}' "
-                        f"(found {int(store.edge_index[0].max())})",
+                        f"(found {int(store["edge_index"][0].max())})",
                         raise_on_error)
 
                 if (num_dst_nodes is not None
-                        and store.edge_index[1].max() >= num_dst_nodes):
+                        and store["edge_index"][1].max() >= num_dst_nodes):
                     status = False
                     warn_or_raise(
                         f"'edge_index' of edge type {edge_type} contains "
                         f"larger destination indices than the number of nodes "
                         f"({num_dst_nodes}) of this node type in '{cls_name}' "
-                        f"(found {int(store.edge_index[1].max())})",
+                        f"(found {int(store["edge_index"][1].max())})",
                         raise_on_error)
 
         return status
 
+    # TODO: ??? I assume this can be safely removed?
     def debug(self):
         pass  # TODO
 
@@ -756,7 +840,8 @@ class HeteroData(object):
         out = self.node_stores.get(key, None)
         if out is None:
             self._check_type_name(key)
-            self.node_stores[key] = dict()
+            out = dict()
+            self.node_stores[key] = out
         return out
 
     def get_edge_store(self, src: str, rel: str, dst: str) -> Dict[str, Any]:
@@ -773,24 +858,25 @@ class HeteroData(object):
         out = self.edge_stores.get(key, None)
         if out is None:
             self._check_type_name(rel)
-            self.edge_stores[key] = dict()
+            out = dict()
+            self.edge_stores[key] = out
         return out
 
     def rename(self, name: NodeType, new_name: NodeType) -> Self:
         r"""Renames the node type :obj:`name` to :obj:`new_name` in-place."""
-        node_store = self._node_store_dict.pop(name)
-        node_store._key = new_name
-        self._node_store_dict[new_name] = node_store
+        node_store = self.node_stores.pop(name)
+        node_store["_key"] = new_name
+        self.node_stores[new_name] = node_store
 
         for edge_type in self.edge_types:
             src, rel, dst = edge_type
             if src == name or dst == name:
-                edge_store = self._edge_store_dict.pop(edge_type)
+                edge_store = self.edge_stores.pop(edge_type)
                 src = new_name if src == name else src
                 dst = new_name if dst == name else dst
                 edge_type = (src, rel, dst)
-                edge_store._key = edge_type
-                self._edge_store_dict[edge_type] = edge_store
+                edge_store["_key"] = edge_type
+                self.edge_stores[edge_type] = edge_store
 
         return self
 
@@ -843,48 +929,49 @@ class HeteroData(object):
         subset_dict = copy.copy(subset_dict)
 
         for node_type, subset in subset_dict.items():
-            for key, value in self[node_type].items():
+            for key, value in self.node_stores[node_type].items():
                 if key == 'num_nodes':
                     if subset.dtype == torch.bool:
-                        data[node_type].num_nodes = int(subset.sum())
+                        data[node_type]["num_nodes"] = int(subset.sum())
                     else:
-                        data[node_type].num_nodes = subset.size(0)
-                elif self[node_type].is_node_attr(key):
+                        data[node_type]["num_nodes"] = subset.size(0)
+                elif is_node_attr(self.node_stores[node_type], key):
                     data[node_type][key] = value[subset]
                 else:
                     data[node_type][key] = value
 
         for edge_type in self.edge_types:
-            if 'edge_index' not in self[edge_type]:
+            if 'edge_index' not in self.edge_stores[edge_type]:
                 continue
 
             src, _, dst = edge_type
 
             src_subset = subset_dict.get(src)
             if src_subset is None:
-                src_subset = torch.arange(data[src].num_nodes)
+                src_subset = torch.arange(data[src]["num_nodes"])
             dst_subset = subset_dict.get(dst)
             if dst_subset is None:
-                dst_subset = torch.arange(data[dst].num_nodes)
+                dst_subset = torch.arange(data[dst]["num_nodes"])
 
             edge_index, _, edge_mask = bipartite_subgraph(
                 (src_subset, dst_subset),
-                self[edge_type].edge_index,
+                self.edge_stores[edge_type]["edge_index"],
                 relabel_nodes=True,
-                size=(self[src].num_nodes, self[dst].num_nodes),
+                size=(self.node_stores[src]["num_nodes"], self.node_stores[dst]["num_nodes"]),
                 return_edge_mask=True,
             )
 
-            for key, value in self[edge_type].items():
+            for key, value in self.edge_stores[edge_type].items():
                 if key == 'edge_index':
-                    data[edge_type].edge_index = edge_index
-                elif self[edge_type].is_edge_attr(key):
+                    data[edge_type]["edge_index"] = edge_index
+                elif is_edge_attr(self.edge_stores[edge_type], key):
                     data[edge_type][key] = value[edge_mask]
                 else:
                     data[edge_type][key] = value
 
         return data
 
+    # TODO: you are here
     def edge_subgraph(
         self,
         subset_dict: Dict[EdgeType, Tensor],

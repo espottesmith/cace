@@ -27,6 +27,7 @@ import zipfile
 
 import torch
 from torch import Tensor
+from torch.utils.dlpack import from_dlpack
 
 
 # Typing
@@ -43,7 +44,16 @@ WITH_PT113 = WITH_PT20 or int(torch.__version__.split('.')[1]) >= 13
 MAX_INT64 = torch.iinfo(torch.int64).max
 
 OptTensor = Optional[Tensor]
+PairTensor = Tuple[Tensor, Tensor]
+OptPairTensor = Tuple[Tensor, Optional[Tensor]]
+PairOptTensor = Tuple[Optional[Tensor], Optional[Tensor]]
 MISSING = '???'
+
+
+class AttrType(Enum):
+    NODE = 'NODE'
+    EDGE = 'EDGE'
+    OTHER = 'OTHER'
 
 
 class SparseTensor:  # type: ignore
@@ -654,3 +664,448 @@ def remove_self_loops(  # noqa: F811
         return edge_index, None
     else:
         return edge_index, edge_attr[mask]
+
+
+def lexsort(
+    keys: List[Tensor],
+    dim: int = -1,
+    descending: bool = False,
+) -> Tensor:
+    r"""Performs an indirect stable sort using a sequence of keys.
+
+    Given multiple sorting keys, returns an array of integer indices that
+    describe their sort order.
+    The last key in the sequence is used for the primary sort order, the
+    second-to-last key for the secondary sort order, and so on.
+
+    Args:
+        keys ([torch.Tensor]): The :math:`k` different columns to be sorted.
+            The last key is the primary sort key.
+        dim (int, optional): The dimension to sort along. (default: :obj:`-1`)
+        descending (bool, optional): Controls the sorting order (ascending or
+            descending). (default: :obj:`False`)
+    """
+    assert len(keys) >= 1
+
+    if not WITH_PT113:
+        keys = [k.neg() for k in keys] if descending else keys
+        out = np.lexsort([k.detach().cpu().numpy() for k in keys], axis=dim)
+        return torch.from_numpy(out).to(keys[0].device)
+
+    out = keys[0].argsort(dim=dim, descending=descending, stable=True)
+    for k in keys[1:]:
+        index = k.gather(dim, out)
+        index = index.argsort(dim=dim, descending=descending, stable=True)
+        out = out.gather(dim, index)
+
+    return out
+
+
+def sort_edge_index(  # noqa: F811
+    edge_index: Tensor,
+    edge_attr: Union[OptTensor, List[Tensor], str] = MISSING,
+    num_nodes: Optional[int] = None,
+    sort_by_row: bool = True,
+) -> Union[Tensor, Tuple[Tensor, OptTensor], Tuple[Tensor, List[Tensor]]]:
+    """Row-wise sorts :obj:`edge_index`.
+
+    Args:
+        edge_index (torch.Tensor): The edge indices.
+        edge_attr (torch.Tensor or List[torch.Tensor], optional): Edge weights
+            or multi-dimensional edge features.
+            If given as a list, will re-shuffle and remove duplicates for all
+            its entries. (default: :obj:`None`)
+        num_nodes (int, optional): The number of nodes, *i.e.*
+            :obj:`max_val + 1` of :attr:`edge_index`. (default: :obj:`None`)
+        sort_by_row (bool, optional): If set to :obj:`False`, will sort
+            :obj:`edge_index` column-wise/by destination node.
+            (default: :obj:`True`)
+
+    :rtype: :class:`LongTensor` if :attr:`edge_attr` is not passed, else
+        (:class:`LongTensor`, :obj:`Optional[Tensor]` or :obj:`List[Tensor]]`)
+
+    .. warning::
+
+        From :pyg:`PyG >= 2.3.0` onwards, this function will always return a
+        tuple whenever :obj:`edge_attr` is passed as an argument (even in case
+        it is set to :obj:`None`).
+
+    Examples:
+        >>> edge_index = torch.tensor([[2, 1, 1, 0],
+                                [1, 2, 0, 1]])
+        >>> edge_attr = torch.tensor([[1], [2], [3], [4]])
+        >>> sort_edge_index(edge_index)
+        tensor([[0, 1, 1, 2],
+                [1, 0, 2, 1]])
+
+        >>> sort_edge_index(edge_index, edge_attr)
+        (tensor([[0, 1, 1, 2],
+                [1, 0, 2, 1]]),
+        tensor([[4],
+                [3],
+                [2],
+                [1]]))
+    """
+    num_nodes = maybe_num_nodes(edge_index, num_nodes)
+
+    if num_nodes * num_nodes > MAX_INT64:
+        if not WITH_PT113:
+            raise ValueError("'sort_edge_index' will result in an overflow")
+        perm = lexsort(keys=[
+            edge_index[int(sort_by_row)],
+            edge_index[1 - int(sort_by_row)],
+        ])
+    else:
+        idx = edge_index[1 - int(sort_by_row)] * num_nodes
+        idx += edge_index[int(sort_by_row)]
+        _, perm = index_sort(idx, max_value=num_nodes * num_nodes)
+
+    if isinstance(edge_index, Tensor):
+        edge_index = edge_index[:, perm]
+    elif isinstance(edge_index, tuple):
+        edge_index = (edge_index[0][perm], edge_index[1][perm])
+    else:
+        raise NotImplementedError
+
+    if edge_attr is None:
+        return edge_index, None
+    if isinstance(edge_attr, Tensor):
+        return edge_index, edge_attr[perm]
+    if isinstance(edge_attr, (list, tuple)):
+        return edge_index, [e[perm] for e in edge_attr]
+
+    return edge_index
+
+
+def is_undirected(  # noqa: F811
+    edge_index: Tensor,
+    edge_attr: Union[Optional[Tensor], List[Tensor]] = None,
+    num_nodes: Optional[int] = None,
+) -> bool:
+    r"""Returns :obj:`True` if the graph given by :attr:`edge_index` is
+    undirected.
+
+    Args:
+        edge_index (LongTensor): The edge indices.
+        edge_attr (Tensor or List[Tensor], optional): Edge weights or multi-
+            dimensional edge features.
+            If given as a list, will check for equivalence in all its entries.
+            (default: :obj:`None`)
+        num_nodes (int, optional): The number of nodes, *i.e.*
+            :obj:`max(edge_index) + 1`. (default: :obj:`None`)
+
+    :rtype: bool
+
+    Examples:
+        >>> edge_index = torch.tensor([[0, 1, 0],
+        ...                         [1, 0, 0]])
+        >>> weight = torch.tensor([0, 0, 1])
+        >>> is_undirected(edge_index, weight)
+        True
+
+        >>> weight = torch.tensor([0, 1, 1])
+        >>> is_undirected(edge_index, weight)
+        False
+
+    """
+    num_nodes = maybe_num_nodes(edge_index, num_nodes)
+
+    edge_attrs: List[Tensor] = []
+    if isinstance(edge_attr, Tensor):
+        edge_attrs.append(edge_attr)
+    elif isinstance(edge_attr, (list, tuple)):
+        edge_attrs = edge_attr
+
+    edge_index1, edge_attrs1 = sort_edge_index(
+        edge_index,
+        edge_attrs,
+        num_nodes=num_nodes,
+        sort_by_row=True,
+    )
+    edge_index2, edge_attrs2 = sort_edge_index(
+        edge_index,
+        edge_attrs,
+        num_nodes=num_nodes,
+        sort_by_row=False,
+    )
+
+    if not torch.equal(edge_index1[0], edge_index2[1]):
+        return False
+
+    if not torch.equal(edge_index1[1], edge_index2[0]):
+        return False
+
+    assert isinstance(edge_attrs1, list) and isinstance(edge_attrs2, list)
+    for edge_attr1, edge_attr2 in zip(edge_attrs1, edge_attrs2):
+        if not torch.equal(edge_attr1, edge_attr2):
+            return False
+
+    return True
+
+
+def index_to_mask(index: Tensor, size: Optional[int] = None) -> Tensor:
+    r"""Converts indices to a mask representation.
+
+    Args:
+        index (Tensor): The indices.
+        size (int, optional): The size of the mask. If set to :obj:`None`, a
+            minimal sized output mask is returned.
+
+    Example:
+        >>> index = torch.tensor([1, 3, 5])
+        >>> index_to_mask(index)
+        tensor([False,  True, False,  True, False,  True])
+
+        >>> index_to_mask(index, size=7)
+        tensor([False,  True, False,  True, False,  True, False])
+    """
+    index = index.view(-1)
+    size = int(index.max()) + 1 if size is None else size
+    mask = index.new_zeros(size, dtype=torch.bool)
+    mask[index] = True
+    return mask
+
+
+# TODO: this
+def map_index(
+    src: Tensor,
+    index: Tensor,
+    max_index: Optional[Union[int, Tensor]] = None,
+    inclusive: bool = False,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    r"""Maps indices in :obj:`src` to the positional value of their
+    corresponding occurrence in :obj:`index`.
+    Indices must be strictly positive.
+
+    Args:
+        src (torch.Tensor): The source tensor to map.
+        index (torch.Tensor): The index tensor that denotes the new mapping.
+        max_index (int, optional): The maximum index value.
+            (default :obj:`None`)
+        inclusive (bool, optional): If set to :obj:`True`, it is assumed that
+            every entry in :obj:`src` has a valid entry in :obj:`index`.
+            Can speed-up computation. (default: :obj:`False`)
+
+    :rtype: (:class:`torch.Tensor`, :class:`torch.BoolTensor`)
+
+    Examples:
+        >>> src = torch.tensor([2, 0, 1, 0, 3])
+        >>> index = torch.tensor([3, 2, 0, 1])
+
+        >>> map_index(src, index)
+        (tensor([1, 2, 3, 2, 0]), tensor([True, True, True, True, True]))
+
+        >>> src = torch.tensor([2, 0, 1, 0, 3])
+        >>> index = torch.tensor([3, 2, 0])
+
+        >>> map_index(src, index)
+        (tensor([1, 2, 2, 0]), tensor([True, True, False, True, True]))
+
+    .. note::
+
+        If inputs are on GPU and :obj:`cudf` is available, consider using RMM
+        for significant speed boosts.
+        Proceed with caution as RMM may conflict with other allocators or
+        fragments.
+
+        .. code-block:: python
+
+            import rmm
+            rmm.reinitialize(pool_allocator=True)
+            torch.cuda.memory.change_current_allocator(rmm.rmm_torch_allocator)
+    """
+    if src.is_floating_point():
+        raise ValueError(f"Expected 'src' to be an index (got '{src.dtype}')")
+    if index.is_floating_point():
+        raise ValueError(f"Expected 'index' to be an index (got "
+                         f"'{index.dtype}')")
+    if src.device != index.device:
+        raise ValueError(f"Both 'src' and 'index' must be on the same device "
+                         f"(got '{src.device}' and '{index.device}')")
+
+    if max_index is None:
+        max_index = torch.maximum(src.max(), index.max())
+
+    # If the `max_index` is in a reasonable range, we can accelerate this
+    # operation by creating a helper vector to perform the mapping.
+    # NOTE This will potentially consumes a large chunk of memory
+    # (max_index=10 million => ~75MB), so we cap it at a reasonable size:
+    THRESHOLD = 40_000_000 if src.is_cuda else 10_000_000
+    if max_index <= THRESHOLD:
+        if inclusive:
+            assoc = src.new_empty(max_index + 1)  # type: ignore
+        else:
+            assoc = src.new_full((max_index + 1, ), -1)  # type: ignore
+        assoc[index] = torch.arange(index.numel(), dtype=src.dtype,
+                                    device=src.device)
+        out = assoc[src]
+
+        if inclusive:
+            return out, None
+        else:
+            mask = out != -1
+            return out[mask], mask
+
+    WITH_CUDF = False
+    if src.is_cuda:
+        try:
+            import cudf
+            WITH_CUDF = True
+        except ImportError:
+            import pandas as pd
+            warnings.warn("Using CPU-based processing within 'map_index' "
+                          "which may cause slowdowns and device "
+                          "synchronization. Consider installing 'cudf' to "
+                          "accelerate computation")
+    else:
+        import pandas as pd
+
+    if not WITH_CUDF:
+        left_ser = pd.Series(src.cpu().numpy(), name='left_ser')
+        right_ser = pd.Series(
+            index=index.cpu().numpy(),
+            data=pd.RangeIndex(0, index.size(0)),
+            name='right_ser',
+        )
+
+        result = pd.merge(left_ser, right_ser, how='left', left_on='left_ser',
+                          right_index=True)
+
+        out_numpy = result['right_ser'].values
+        if (index.device.type == 'mps'  # MPS does not support `float64`
+                and issubclass(out_numpy.dtype.type, np.floating)):
+            out_numpy = out_numpy.astype(np.float32)
+
+        out = torch.from_numpy(out_numpy).to(index.device)
+
+        if out.is_floating_point() and inclusive:
+            raise ValueError("Found invalid entries in 'src' that do not have "
+                             "a corresponding entry in 'index'. Set "
+                             "`inclusive=False` to ignore these entries.")
+
+        if out.is_floating_point():
+            mask = torch.isnan(out).logical_not_()
+            out = out[mask].to(index.dtype)
+            return out, mask
+
+        if inclusive:
+            return out, None
+        else:
+            mask = out != -1
+            return out[mask], mask
+
+    else:
+        left_ser = cudf.Series(src, name='left_ser')
+        right_ser = cudf.Series(
+            index=index,
+            data=cudf.RangeIndex(0, index.size(0)),
+            name='right_ser',
+        )
+
+        result = cudf.merge(left_ser, right_ser, how='left',
+                            left_on='left_ser', right_index=True, sort=True)
+
+        if inclusive:
+            try:
+                out = from_dlpack(result['right_ser'].to_dlpack())
+            except ValueError:
+                raise ValueError("Found invalid entries in 'src' that do not "
+                                 "have a corresponding entry in 'index'. Set "
+                                 "`inclusive=False` to ignore these entries.")
+        else:
+            out = from_dlpack(result['right_ser'].fillna(-1).to_dlpack())
+
+        out = out[src.argsort().argsort()]  # Restore original order.
+
+        if inclusive:
+            return out, None
+        else:
+            mask = out != -1
+            return out[mask], mask
+
+
+def bipartite_subgraph(
+    subset: Union[PairTensor, Tuple[List[int], List[int]]],
+    edge_index: Tensor,
+    edge_attr: OptTensor = None,
+    relabel_nodes: bool = False,
+    size: Optional[Tuple[int, int]] = None,
+    return_edge_mask: bool = False,
+) -> Union[Tuple[Tensor, OptTensor], Tuple[Tensor, OptTensor, OptTensor]]:
+    r"""Returns the induced subgraph of the bipartite graph
+    :obj:`(edge_index, edge_attr)` containing the nodes in :obj:`subset`.
+
+    Args:
+        subset (Tuple[Tensor, Tensor] or tuple([int],[int])): The nodes
+            to keep.
+        edge_index (LongTensor): The edge indices.
+        edge_attr (Tensor, optional): Edge weights or multi-dimensional
+            edge features. (default: :obj:`None`)
+        relabel_nodes (bool, optional): If set to :obj:`True`, the resulting
+            :obj:`edge_index` will be relabeled to hold consecutive indices
+            starting from zero. (default: :obj:`False`)
+        size (tuple, optional): The number of nodes.
+            (default: :obj:`None`)
+        return_edge_mask (bool, optional): If set to :obj:`True`, will return
+            the edge mask to filter out additional edge features.
+            (default: :obj:`False`)
+
+    :rtype: (:class:`LongTensor`, :class:`Tensor`)
+
+    Examples:
+        >>> edge_index = torch.tensor([[0, 5, 2, 3, 3, 4, 4, 3, 5, 5, 6],
+        ...                            [0, 0, 3, 2, 0, 0, 2, 1, 2, 3, 1]])
+        >>> edge_attr = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        >>> subset = (torch.tensor([2, 3, 5]), torch.tensor([2, 3]))
+        >>> bipartite_subgraph(subset, edge_index, edge_attr)
+        (tensor([[2, 3, 5, 5],
+                [3, 2, 2, 3]]),
+        tensor([ 3,  4,  9, 10]))
+
+        >>> bipartite_subgraph(subset, edge_index, edge_attr,
+        ...                    return_edge_mask=True)
+        (tensor([[2, 3, 5, 5],
+                [3, 2, 2, 3]]),
+        tensor([ 3,  4,  9, 10]),
+        tensor([False, False,  True,  True, False, False, False, False,
+                True,  True,  False]))
+    """
+    device = edge_index.device
+
+    src_subset, dst_subset = subset
+    if not isinstance(src_subset, Tensor):
+        src_subset = torch.tensor(src_subset, dtype=torch.long, device=device)
+    if not isinstance(dst_subset, Tensor):
+        dst_subset = torch.tensor(dst_subset, dtype=torch.long, device=device)
+
+    if src_subset.dtype != torch.bool:
+        src_size = int(edge_index[0].max()) + 1 if size is None else size[0]
+        src_node_mask = index_to_mask(src_subset, size=src_size)
+    else:
+        src_size = src_subset.size(0)
+        src_node_mask = src_subset
+        src_subset = src_subset.nonzero().view(-1)
+
+    if dst_subset.dtype != torch.bool:
+        dst_size = int(edge_index[1].max()) + 1 if size is None else size[1]
+        dst_node_mask = index_to_mask(dst_subset, size=dst_size)
+    else:
+        dst_size = dst_subset.size(0)
+        dst_node_mask = dst_subset
+        dst_subset = dst_subset.nonzero().view(-1)
+
+    edge_mask = src_node_mask[edge_index[0]] & dst_node_mask[edge_index[1]]
+    edge_index = edge_index[:, edge_mask]
+    edge_attr = edge_attr[edge_mask] if edge_attr is not None else None
+
+    if relabel_nodes:
+        src_index, _ = map_index(edge_index[0], src_subset, max_index=src_size,
+                                 inclusive=True)
+        dst_index, _ = map_index(edge_index[1], dst_subset, max_index=dst_size,
+                                 inclusive=True)
+        edge_index = torch.stack([src_index, dst_index], dim=0)
+
+    if return_edge_mask:
+        return edge_index, edge_attr, edge_mask
+    else:
+        return edge_index, edge_attr
